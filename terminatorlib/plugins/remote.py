@@ -36,10 +36,13 @@ DESCRIPTION
 DOCKER/PODMAN API INTEGRATION
     The plugin talks to the Docker/Podman API directly over its unix socket
     using only the Python standard library -- no `docker` SDK or extra
-    dependencies required. When an API socket is available it provides enhanced
-    container support: the container working directory is detected via the
-    `/inspect` endpoint (so `cd` is more reliable) and container clones use
-    `docker exec -w /path` instead of sending a `cd` command afterwards.
+    dependencies required. The API is used for two things:
+
+      1. listing running containers for the Attach to Container submenu
+         (GET /containers/json)
+      2. guessing the container name after a manual `docker run` that
+         omitted `--name` (picks the most recently created running
+         container)
 
     API sockets are tried in order:
       1. `socket_path` config option (if set)
@@ -72,15 +75,22 @@ PASSWORD AUTO-ENTRY
     and the target host). If secret-tool is missing or nothing is stored,
     the lookup simply fails and ssh behaves normally — you type the
     password yourself. A different lookup command can be set globally via
-    `ssh_password_command` or per host via `password_command`.
+    `ssh_password_command` or per host via `password_command` (the per-host
+    value replaces the global one entirely; a host without one falls back
+    to the global). Both accept the same two forms:
 
-    Shorthand form: a lookup value of the form '<manager>:<path>' is
-    executed as an argv list (no shell) instead of a shell command, e.g.
-    `password_command = pass:ssh/sp-0` runs `pass ssh/sp-0`. Shorthands
-    support {host}/{user} placeholders (e.g. 'pass:ssh/{host}') and the
-    set of managers is a small registry (PASSWORD_MANAGER_SHORTHANDS) —
-    add an entry to support another password manager. Values that don't
-    start with a registered prefix keep working as full shell commands.
+      * a full shell command with {host}/{user} placeholders, e.g.
+        `secret-tool lookup service ssh host {host} user {user}`
+      * a '<manager>:<path>' shorthand executed as an argv list (no shell),
+        e.g. `pass:ssh/{host}` runs `pass ssh/<host>` — set it globally to
+        use the same password store for every host without a per-host
+        `password_command`, or per host for a specific entry path
+
+    Shorthand support details: placeholders like {host}/{user} work in
+    shorthands too, the set of managers is a small registry
+    (PASSWORD_MANAGER_SHORTHANDS) — add an entry to support another
+    password manager — and values that don't start with a registered
+    prefix keep working as full shell commands.
 
     Guard rails: prompts containing 'sudo' never match; auto-entry only
     runs within ~60s of the ssh process starting (so later in-session
@@ -113,7 +123,9 @@ CONFIGURATION
       * socket_path: Optional Docker/Podman API socket path (default: auto-detect)
       * ssh_password_command: command run to fetch the SSH password when ssh
         prompts for one; {host} and {user} are placeholders (default uses
-        secret-tool, see PASSWORD AUTO-ENTRY below). Set to "" to disable
+        secret-tool, see PASSWORD AUTO-ENTRY below). May also be a
+        '<manager>:<path>' shorthand like 'pass:ssh/{host}' (same forms as
+        the per-host password_command). Set to "" to disable
       * ssh_password_max_attempts: max auto-entry attempts per ssh process (3)
 
     Host section:
