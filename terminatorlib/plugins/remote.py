@@ -52,6 +52,41 @@ DOCKER/PODMAN API INTEGRATION
     psutil-based cmdline parsing -- no functionality is lost.
     Podman users enable the socket with: systemctl --user start podman.socket
 
+PASSWORD AUTO-ENTRY
+    When ssh sits on a password prompt, the plugin looks the secret up and
+    types it in. The lookup user/host are taken from the prompt itself
+    ("user@host's password:"), so hosts behind a ProxyJump work: each hop
+    names itself and gets its own lookup. Prompt hostnames are mapped back
+    to ssh config aliases via `ssh -G` (using the configured ssh_command),
+    so config sections and lookups stay keyed by the alias. Fallbacks (key
+    passphrases, bare "Password:" prompts) resolve user/host through
+    `ssh -G` and the ssh cmdline. The default lookup command is:
+
+      secret-tool lookup service ssh host {host} user {user}
+
+    Store each password once in the standard libsecret keyring with:
+
+      secret-tool store --label='ssh foo' service ssh host foo user $USER
+
+    For a ProxyJump chain, store one entry per hop (e.g. both the bastion
+    and the target host). If secret-tool is missing or nothing is stored,
+    the lookup simply fails and ssh behaves normally — you type the
+    password yourself. A different lookup command can be set globally via
+    `ssh_password_command` or per host via `password_command`.
+
+    Shorthand form: a lookup value of the form '<manager>:<path>' is
+    executed as an argv list (no shell) instead of a shell command, e.g.
+    `password_command = pass:ssh/sp-0` runs `pass ssh/sp-0`. Shorthands
+    support {host}/{user} placeholders (e.g. 'pass:ssh/{host}') and the
+    set of managers is a small registry (PASSWORD_MANAGER_SHORTHANDS) —
+    add an entry to support another password manager. Values that don't
+    start with a registered prefix keep working as full shell commands.
+
+    Guard rails: prompts containing 'sudo' never match; auto-entry only
+    runs within ~60s of the ssh process starting (so later in-session
+    prompts like `passwd` never get the secret); and at most
+    `ssh_password_max_attempts` attempts are made per ssh process.
+
 INSTALLATION
     Put this file in ~/.config/terminator/plugins/
     Start Terminator and enable Remote in
@@ -67,7 +102,8 @@ CONFIGURATION
       * infer_cwd: When cloned, parse CWD from PS1 and `cd` into it (True)
       * use_pwd: When set (via menu toggle), send `pwd` to the remote shell to
         determine CWD instead of regex-matching the PS1 (False)
-      * ssh_command: SSH executable to use ("ssh")
+      * ssh_command: SSH executable to use ("ssh"); also used for
+        `ssh -G` host/user resolution in the password auto-entry feature
       * container_command: Container runtime executable to use ("docker")
       * container_shell: Shell used when cloning into a container ("sh")
       * ssh_config: Path to SSH config file, supports ~ expansion ("~/.ssh/config")
@@ -75,6 +111,10 @@ CONFIGURATION
       * ssh_default_profile: optional profile for all SSH sessions
       * container_default_profile: optional profile for all container sessions
       * socket_path: Optional Docker/Podman API socket path (default: auto-detect)
+      * ssh_password_command: command run to fetch the SSH password when ssh
+        prompts for one; {host} and {user} are placeholders (default uses
+        secret-tool, see PASSWORD AUTO-ENTRY below). Set to "" to disable
+      * ssh_password_max_attempts: max auto-entry attempts per ssh process (3)
 
     Host section:
       You can add host sections (the host name from SSH config or the container
@@ -84,6 +124,9 @@ CONFIGURATION
       * command: command sent to the remote shell after connecting
       * command_delay: seconds to wait before sending the command (1.0)
       * command_before_cd: send the command before cd (True); False cd's first
+      * password_command: overrides ssh_password_command for this host; may be
+        a '<manager>:<path>' shorthand (e.g. 'pass:ssh/sp-0', run without a
+        shell) or a shell command with {host}/{user} placeholders
 
     ex)
 
@@ -124,7 +167,9 @@ import getopt
 import argparse
 import re
 import json
+import shlex
 import socket
+import subprocess
 import http.client
 import psutil
 import asyncio
@@ -147,6 +192,52 @@ from terminatorlib.version import APP_NAME, APP_VERSION
 AVAILABLE = ['Remote']
 
 CD_CMD = "cd -- {cwd} 2>/dev/null"
+
+# Matches an SSH password/passphrase prompt at the end of the current
+# terminal line, e.g.:
+#   amin@foo's password:
+#   Enter passphrase for key '/home/amin/.ssh/id_ed25519':
+PASSWORD_PROMPT_RE = re.compile(
+    r'(?i)(?:password|passphrase)(?:\s+for\s+[^:]{0,128})?:\s*$'
+)
+
+# Matches OpenSSH's "user@host's password:" prompt, capturing the user and
+# host actually being authenticated. Behind a ProxyJump/bastion each hop
+# prints its own prompt naming itself, so this is more accurate than
+# deriving the host from the ssh cmdline (which is always the final target).
+SSH_PASSWORD_PROMPT_RE = re.compile(
+    r"(?i)(\S{1,128})@(\S{1,128}?)'s password:\s*$"
+)
+
+# Auto-entry is only attempted within this many seconds of the ssh process
+# starting. Password/passphrase prompts always appear during connection
+# setup; the window keeps us from typing the ssh secret into unrelated
+# in-session prompts much later (e.g. `passwd` asking for the current
+# password). Prompts containing 'sudo' are additionally excluded by regex.
+SSH_PASSWORD_WINDOW = 60.0
+
+# How long to wait for a password lookup command to finish. Generous
+# enough for a cold pinentry prompt, but note a timeout is now safe
+# (stale-password guard) — it just means manual typing.
+PASSWORD_FETCH_TIMEOUT = 5.0
+
+# Delayed host commands (command_delay) must not be typed while ssh is
+# sitting on a password prompt: the tty is in no-echo mode, so the text
+# would be swallowed and submitted AS the password. When a prompt is on
+# the cursor row the send is re-checked every
+# PASSWORD_COMMAND_RETRY_INTERVAL ms, at most PASSWORD_COMMAND_MAX_RETRIES
+# times (~60s, matching SSH_PASSWORD_WINDOW), before giving up.
+PASSWORD_COMMAND_RETRY_INTERVAL = 500
+PASSWORD_COMMAND_MAX_RETRIES = 120
+
+# Structured shorthands for `password_command` / `ssh_password_command`:
+# a value of the form '<prefix>:<path>' is executed as an argv list (no
+# shell) instead of a shell command line. Extend this dict to support
+# other password managers, e.g.:
+#   'keepassxc-cli': lambda db_and_entry: [...]
+PASSWORD_MANAGER_SHORTHANDS = {
+    'pass': lambda path: ['pass', path],
+}
 
 # Cache VTE version check at module load instead of per-call
 _VTE_VERSION = "{}.{}".format(
@@ -826,6 +917,12 @@ class Remote(MenuItem):
     # terminals that have already received a host command (prevents double-sending
     # when the dropdown menu already scheduled one before the poller detects it)
     sent_host_commands: Set[Any] = set()
+    # terminal -> {'pid', 'attempts', 'armed', 'row'} state for ssh password auto-entry
+    password_states: Dict[Any, Dict[str, Any]] = {}
+    # alias -> (hostname, user) resolved via `ssh -G`, cached
+    ssh_g_cache: Dict[str, Optional[Tuple[str, str]]] = {}
+    # ssh config path -> (mtime, sorted host aliases), cached
+    ssh_config_cache: Dict[str, Tuple[float, List[str]]] = {}
     # single GLib watch timer shared by all instances
     watch_id: Optional[int] = None
 
@@ -888,7 +985,13 @@ class Remote(MenuItem):
             ret = proc_watch.GetPIDProcInfo(terminal.pid)
             if ret:
                 child, remoteType = ret
+                if isinstance(remoteType, SSHSession):
+                    self._maybe_feed_password(terminal, remoteType, child)
                 if terminal not in self.currRemoteTerminals:
+                    dbg(f"poller: remote session first detected on "
+                        f"terminal pid={terminal.pid}, "
+                        f"type={type(remoteType).__name__}, "
+                        f"proc pid={child.pid} ({child.name()})")
                     self._apply_host_settings(
                         terminal=terminal,
                         proc=child,
@@ -896,6 +999,7 @@ class Remote(MenuItem):
                     )
                     self._send_host_command(terminal, child, remoteType)
             else:
+                Remote.password_states.pop(terminal, None)
                 if terminal in self.currRemoteTerminals and not self._isNewlySpawned(terminal.pid):
                     dbg(f"restoring original profile: {self.currRemoteTerminals[terminal]}")
                     terminal.set_profile(None, profile=self.currRemoteTerminals[terminal])
@@ -917,7 +1021,10 @@ class Remote(MenuItem):
             'cd_delay': "0.25",
             'ssh_command': "ssh",
             'container_command': "docker",
-            'socket_path': ""
+            'socket_path': "",
+            'ssh_password_command':
+                "secret-tool lookup service ssh host {host} user {user}",
+            'ssh_password_max_attempts': "3"
         }
         user_config = Config().plugin_get_config(cls.__name__)
         dbg(f"read user config: {user_config}")
@@ -1054,46 +1161,397 @@ class Remote(MenuItem):
         dbg(f"Selection does not look like a path: '{text}'")
         return None
 
-    def _parse_ssh_config(self):
-        """
-        Parse ~/.ssh/config and return a list of host aliases.
-        Skips wildcard patterns like '*' or '*.example.com'.
-        Follows Include directives.
-        """
-        hosts = []
-        seen = set()
+    def _get_prompt_line(self, terminal: Any) -> Tuple[str, int]:
+        """ get the cursor row's text up to the cursor, plus the row number """
+        vte = terminal.get_vte()
+        if vte is None:
+            return ("", 0)
+        col, row = vte.get_cursor_position()
+        return (
+            vte_get_text(
+                vte_term=vte,
+                start_row=row,
+                start_col=0,
+                end_row=row,
+                end_col=col
+            ) or "",
+            row
+        )
 
-        def parse_file(filepath):
+    def _get_ssh_user(
+        self, remote_session: 'SSHSession', ssh_proc: psutil.Process
+    ) -> Optional[str]:
+        """ get the remote user from the ssh cmdline, if any """
+        try:
+            _, args = remote_session._parse_ssh_args(ssh_proc)
+        except Exception as e:
+            dbg(f"error parsing ssh cmdline for user: {e}")
+            return None
+        if args and '@' in args[0]:
+            return args[0].split('@', 1)[0]
+        return None
+
+    def _maybe_feed_password(
+        self,
+        terminal: Any,
+        remote_session: 'SSHSession',
+        ssh_proc: psutil.Process
+    ) -> None:
+        """
+        If ssh is sitting on a password/passphrase prompt, look the secret up
+        with the configured command (secret-tool by default) and type it in.
+
+        The user/host to look up come from the prompt itself
+        ("user@host's password:") whenever available, so hosts behind a
+        ProxyJump work: each hop names itself and gets its own lookup.
+        Fallbacks (key passphrases, bare "Password:" prompts) use the
+        target parsed from the ssh cmdline.
+
+        Guard rails:
+          * prompts containing 'sudo' never match
+          * only active within SSH_PASSWORD_WINDOW seconds of the ssh
+            process starting (excludes later prompts like `passwd`)
+          * at most ssh_password_max_attempts typed attempts per prompt
+            row, per ssh process
+        """
+        pid = ssh_proc.pid
+        state = Remote.password_states.get(terminal)
+        if state is None or state['pid'] != pid:
+            # new ssh process -> fresh state
+            dbg(f"password auto-entry: new ssh process pid={pid}, "
+                f"resetting state")
+            state = {'pid': pid, 'attempts': 0, 'armed': True, 'row': None}
+            Remote.password_states[terminal] = state
+
+        # give up after too many attempts (bad secret in the keyring, etc)
+        try:
+            max_attempts = int(self._get_config()['ssh_password_max_attempts'])
+        except Exception:
+            max_attempts = 3
+        if state['attempts'] >= max_attempts:
+            dbg(f"password auto-entry: giving up, "
+                f"{state['attempts']}/{max_attempts} attempts used "
+                f"for pid={pid}")
+            return
+
+        # only during connection setup, never deep into an established session
+        try:
+            age = time.time() - ssh_proc.create_time()
+        except psutil.NoSuchProcess:
+            dbg(f"password auto-entry: ssh pid={pid} exited")
+            return
+        if age > SSH_PASSWORD_WINDOW:
+            # log this once per ssh process, not on every poll tick
+            if not state.get('window_expired'):
+                dbg(f"password auto-entry: ssh pid={pid} is {age:.0f}s old, "
+                    f"past the {SSH_PASSWORD_WINDOW:.0f}s window; "
+                    f"auto-entry disabled for this process")
+                state['window_expired'] = True
+            return
+
+        line, row = self._get_prompt_line(terminal)
+        target: Optional[Tuple[str, str]] = None
+        m = SSH_PASSWORD_PROMPT_RE.search(line)
+        if m:
+            # the prompt names the host actually being authenticated
+            target = (m.group(1), m.group(2))
+        elif PASSWORD_PROMPT_RE.search(line) and 'sudo' not in line.lower():
+            # passphrase / bare password prompt: the prompt doesn't name the
+            # target, so fall back to the cmdline host and let `ssh -G`
+            # resolve the effective username from the ssh config
+            host = remote_session.GetHost(ssh_proc) or ''
+            user = (
+                self._get_ssh_user(remote_session, ssh_proc)
+                or self._get_resolved_user(host)
+                or ''
+            )
+            target = (user, host)
+            dbg(f"password auto-entry: generic prompt on row {row}, "
+                f"falling back to cmdline target '{user}@{host}'")
+
+        if target is None:
+            # no prompt on screen right now; re-arm for the next one
+            if not state['armed'] or state['row'] is not None:
+                dbg(f"password auto-entry: no prompt on screen "
+                    f"(cursor row {row}), re-armed for the next one")
+            state['armed'] = True
+            state['row'] = None
+            return
+        if not state['armed'] and state['row'] == row:
+            # already typed for this exact prompt (cursor still on its row);
+            # a redraw/retry appears on a new row and re-arms
+            return
+
+        state['armed'] = False
+        state['row'] = row
+        state['attempts'] += 1
+        user, host = target
+        # prompts show the resolved Hostname (e.g. an IP); map it back to
+        # the ssh config alias so per-host config and secret lookups match
+        canon = host
+        host = self._canonicalize_host(host)
+        if host != canon:
+            dbg(f"password auto-entry: canonicalized prompt host "
+                f"'{canon}' -> '{host}' (attempt {state['attempts']})")
+        # resolve the lookup command (per-host override wins)
+        host_config = self._get_host_config(host) if host else {}
+        template = host_config.get('password_command', '') or \
+            self._get_config()['ssh_password_command']
+        if template and host_config.get('password_command'):
+            dbg(f"password auto-entry: using per-host password_command "
+                f"for '{host}'")
+        if not template:
+            dbg(f"no password command configured for '{user}@{host}'")
+            return
+
+        dbg(f"password prompt detected for '{user}@{host}' on row {row}, "
+            f"attempt {state['attempts']}/{max_attempts}, "
+            f"fetching secret via '{template}'")
+        self._fetch_and_feed_password(terminal, host, user, template)
+
+    def _build_password_cmd(
+        self, template: str, host: str, user: str
+    ) -> Tuple[Optional[List[str]], Optional[str]]:
+        """
+        Turn a password_command template into either an argv list (for a
+        '<manager>:<path>' shorthand, e.g. 'pass:ssh/sp-0') or a shell
+        command line with {host}/{user} placeholders filled in.
+        Returns (argv, shell_cmd) — exactly one is non-None.
+        """
+        for prefix, builder in PASSWORD_MANAGER_SHORTHANDS.items():
+            marker = prefix + ':'
+            if template.startswith(marker):
+                path = template[len(marker):].format(host=host, user=user)
+                dbg(f"password lookup: shorthand '{prefix}' with "
+                    f"path '{path}' (argv, no shell)")
+                return builder(path), None
+        dbg(f"password lookup: shell command "
+            f"'{template.format(host=host, user=user)}'")
+        return None, template.format(host=host, user=user)
+
+    def _fetch_and_feed_password(
+        self, terminal: Any, host: str, user: str, template: str
+    ) -> None:
+        """
+        Run the password lookup off the UI thread and type the result into
+        the terminal when it arrives. The lookup may be a '<manager>:<path>'
+        shorthand (executed without a shell) or a shell command line.
+        """
+        def worker() -> None:
+            password = None
+            t0 = time.time()
+            dbg(f"password lookup: worker thread started for "
+                f"'{user}@{host}' (timeout {PASSWORD_FETCH_TIMEOUT}s)")
             try:
-                with open(os.path.expanduser(filepath), 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line.startswith('#') or not line:
-                            continue
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            if parts[0].lower() == 'host':
-                                for host in parts[1:]:
-                                    # Skip wildcards and negation patterns
-                                    if '*' in host or '?' in host or host.startswith('!'):
-                                        continue
-                                    if host not in seen:
-                                        seen.add(host)
-                                        hosts.append(host)
-                            elif parts[0].lower() == 'include':
-                                # Follow Include directives
-                                include_path = os.path.expanduser(parts[1])
-                                for fpath in sorted(glob.glob(include_path)):
-                                    parse_file(fpath)
-
-            except FileNotFoundError:
-                dbg(f"SSH config file not found: {filepath}")
+                argv, shell_cmd = self._build_password_cmd(template, host, user)
+                if argv is not None:
+                    result = subprocess.run(
+                        argv, capture_output=True, text=True,
+                        timeout=PASSWORD_FETCH_TIMEOUT
+                    )
+                elif shell_cmd is not None:
+                    result = subprocess.run(
+                        shell_cmd, shell=True, capture_output=True,
+                        text=True, timeout=PASSWORD_FETCH_TIMEOUT
+                    )
+                else:  # unreachable: exactly one of argv/shell_cmd is set
+                    raise RuntimeError("password command not resolved")
+                elapsed = time.time() - t0
+                if result.returncode == 0 and result.stdout:
+                    password = result.stdout.rstrip('\r\n')
+                    dbg(f"password lookup: got secret for "
+                        f"'{user}@{host}' in {elapsed:.2f}s "
+                        f"({len(password)} chars)")
+                else:
+                    dbg(f"password command rc={result.returncode}, "
+                        f"no secret (elapsed {elapsed:.2f}s, "
+                        f"stderr: {result.stderr.strip()[:200] or 'none'})")
+            except KeyError as e:
+                err(f"unknown placeholder in password command: {e}")
             except Exception as e:
-                dbg(f"Error parsing SSH config {filepath}: {e}")
+                dbg(f"password lookup failed after "
+                    f"{time.time() - t0:.2f}s: {e}")
+            if password:
+                GLib.idle_add(self._feed_password, terminal, password)
+                dbg(f"password lookup: dispatched typing callback "
+                    f"to UI thread for '{user}@{host}'")
+            else:
+                dbg(f"no password found for '{user}@{host}', "
+                    f"manual typing required")
+        threading.Thread(target=worker, daemon=True).start()
 
-        parse_file(self._get_config()['ssh_config'])
+    def _feed_password(self, terminal: Any, password: str) -> bool:
+        """ type the password + enter into the terminal (GLib idle callback) """
+        # the fetch was async; the screen may have moved on since (user
+        # pressed enter, auth already completed via buffered input, etc).
+        # Only type if a prompt is still on the cursor row.
+        line, row = self._get_prompt_line(terminal)
+        if not PASSWORD_PROMPT_RE.search(line):
+            state = Remote.password_states.get(terminal) or {}
+            dbg(f"password prompt gone before typing, skipping stale "
+                f"password (cursor row {row} now reads "
+                f"'{line.strip()[:80] or '<empty>'}')")
+            return False
+        vte = terminal.get_vte()
+        if vte is not None:
+            dbg(f"typing password into terminal "
+                f"({len(password)} chars + enter)")
+            vte.feed_child((password + '\n').encode())
+        return False  # run once
+
+    def _parse_ssh_config(self) -> List[str]:
+        """
+        Parse the configured ssh_config and return a sorted list of host
+        aliases (wildcard patterns and negations skipped). Follows Include
+        directives. Tokenizes each line properly (inline comments, quoted
+        arguments, `Host=name` form) and caches the result on the file's
+        mtime. Only used to ENUMERATE aliases for the menu — all semantic
+        resolution (hostname, user, proxy) goes through `ssh -G`.
+        """
+        path = os.path.expanduser(self._get_config()['ssh_config'])
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            dbg(f"SSH config file not found: {path}")
+            return []
+        cached = Remote.ssh_config_cache.get(path)
+        if cached and cached[0] == mtime:
+            return cached[1]
+
+        hosts: List[str] = []
+        seen: Set[str] = set()
+        self._parse_ssh_config_file(path, hosts, seen)
         hosts.sort()
+        Remote.ssh_config_cache[path] = (mtime, hosts)
         return hosts
+
+    def _parse_ssh_config_file(
+        self, filepath: str, hosts: List[str], seen: Set[str]
+    ) -> None:
+        """ parse one ssh config file into the host alias list """
+        try:
+            with open(os.path.expanduser(filepath), 'r') as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        # handles inline comments and quoted arguments
+                        tokens = shlex.split(line, comments=True)
+                    except ValueError as e:
+                        dbg(f"skipping malformed ssh config line: {e}")
+                        continue
+                    if not tokens:
+                        continue
+                    keyword = tokens[0].lower()
+                    # support the `Host=name` / `Include=...` keyword=value form
+                    if '=' in keyword:
+                        key, _, arg = keyword.partition('=')
+                        tokens = [key, arg] + tokens[1:]
+                    if len(tokens) < 2:
+                        continue
+                    key = tokens[0].lower()
+                    args = tokens[1:]
+                    if key == 'host':
+                        for h in args:
+                            # skip wildcards and negation patterns
+                            if '*' in h or '?' in h or h.startswith('!'):
+                                continue
+                            if h not in seen:
+                                seen.add(h)
+                                hosts.append(h)
+                    elif key == 'include':
+                        for pattern in args:
+                            for fpath in sorted(
+                                glob.glob(os.path.expanduser(pattern))
+                            ):
+                                self._parse_ssh_config_file(
+                                    fpath, hosts, seen
+                                )
+        except FileNotFoundError:
+            dbg(f"SSH config file not found: {filepath}")
+        except Exception as e:
+            dbg(f"Error parsing SSH config {filepath}: {e}")
+
+    def _ssh_g_hostinfo(self, host: str) -> Optional[Tuple[str, str]]:
+        """
+        Query `ssh -G host` using the configured ssh binary and return
+        (hostname, user) — ssh's own fully-resolved view of the target,
+        honoring Includes, Match blocks, wildcards and User directives.
+        Respects the configured ssh_config file (passed via -F) and the
+        ssh_command executable. Returns None if the query fails. Results
+        are cached per host.
+        """
+        if host in Remote.ssh_g_cache:
+            return Remote.ssh_g_cache[host]
+        info: Optional[Tuple[str, str]] = None
+        ssh_exe = self._get_config()['ssh_command']
+        cmd = [ssh_exe, '-G']
+        # honor the plugin's ssh_config option; only pass -F when the file
+        # exists so a missing file can't make ssh -G error out entirely
+        config_path = os.path.expanduser(self._get_config()['ssh_config'])
+        if os.path.exists(config_path):
+            cmd += ['-F', config_path]
+        cmd.append(host)
+        result = None
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True, text=True, timeout=5
+            )
+        except OSError as e:
+            # some ssh_command values (e.g. shell scripts without a shebang)
+            # can't be exec'd directly by the kernel; an interactive shell
+            # falls back to interpreting them as scripts, so do the same
+            dbg(f"ssh -G direct exec of '{ssh_exe}' failed ({e}), retrying via shell")
+            try:
+                cmd_str = ' '.join(shlex.quote(c) for c in cmd)
+                result = subprocess.run(
+                    cmd_str, shell=True,
+                    capture_output=True, text=True, timeout=5
+                )
+            except Exception as e2:
+                dbg(f"ssh -G shell retry failed: {e2}")
+        except Exception as e:
+            dbg(f"ssh -G query for '{host}' failed: {e}")
+        if result is not None:
+            hostname = None
+            user = None
+            for line in result.stdout.splitlines():
+                parts = line.split(None, 1)
+                if len(parts) != 2:
+                    continue
+                key = parts[0].lower()
+                if key == 'hostname' and hostname is None:
+                    hostname = parts[1].strip()
+                elif key == 'user' and user is None:
+                    user = parts[1].strip()
+            if hostname is not None:
+                info = (hostname, user or '')
+        Remote.ssh_g_cache[host] = info
+        return info
+
+    def _canonicalize_host(self, host: str) -> str:
+        """
+        Map a hostname/IP from a password prompt back to its ssh config
+        alias ('192.168.1.100' -> 'sp-0'), resolving each known alias via
+        `ssh -G`. Aliases and unknown hosts are returned unchanged.
+        """
+        if not host:
+            return host
+        aliases = self._parse_ssh_config()
+        if host in aliases:
+            return host  # already an alias
+        for alias in aliases:
+            info = self._ssh_g_hostinfo(alias)
+            if info and info[0] == host:
+                dbg(f"canonicalized prompt host '{host}' -> '{alias}'")
+                return alias
+        return host
+
+    def _get_resolved_user(self, host: str) -> Optional[str]:
+        """ effective username ssh would use for `host`, per its config """
+        info = self._ssh_g_hostinfo(host)
+        return info[1] or None if info else None
 
     def _get_running_containers(self):
         """
@@ -1114,14 +1572,50 @@ class Remote(MenuItem):
             dbg(f"Error listing containers: {e}")
             return []
 
-    def _send_delayed_command(self, vte, command, delay_ms):
-        """Send a command to the terminal after a delay"""
-        def send():
+    def _send_delayed_command(self, terminal, command, delay_ms):
+        """Send a command to the terminal after a delay
+
+        The command is only typed once NO password prompt sits on the
+        cursor row. Typing into an active password prompt would corrupt
+        auth: the tty is in no-echo mode, so the command text (and its
+        trailing newline) is consumed by ssh as the password and
+        submitted ("Permission denied"), and the real secret fetched by
+        the auto-entry then finds no prompt left to answer. When a prompt
+        IS on the cursor row the send is re-checked every
+        PASSWORD_COMMAND_RETRY_INTERVAL ms — the prompt disappears once
+        the auto-entered (or manually typed) password is accepted — and
+        the command is sent then.
+        """
+        def send(retries: int = PASSWORD_COMMAND_MAX_RETRIES) -> bool:
+            line, _row = self._get_prompt_line(terminal)
+            if PASSWORD_PROMPT_RE.search(line):
+                if retries > 0:
+                    dbg(f"delayed command '{command}': password prompt "
+                        f"still active, deferring "
+                        f"({PASSWORD_COMMAND_MAX_RETRIES - retries + 1}/"
+                        f"{PASSWORD_COMMAND_MAX_RETRIES})")
+                    GLib.timeout_add(
+                        PASSWORD_COMMAND_RETRY_INTERVAL,
+                        lambda: send(retries - 1)
+                    )
+                    return False
+                dbg(f"delayed command '{command}': password prompt "
+                    f"persisted too long "
+                    f"({PASSWORD_COMMAND_MAX_RETRIES} retries), "
+                    f"giving up — send it manually if needed")
+                return False
+            vte = terminal.get_vte()
+            if vte is None:
+                dbg(f"delayed command '{command}': terminal has no vte, "
+                    f"skipping")
+                return False
             cmd = f"{command}\n"
             dbg(f"Sending delayed command '{command}'")
             vte.feed_child(cmd.encode())
             return False  # run once
         GLib.timeout_add(delay_ms, send)
+        dbg(f"scheduled delayed command '{command}' for "
+            f"{delay_ms}ms from now")
 
     def _send_host_command(self, terminal, child, remote_session):
         """
@@ -1150,16 +1644,19 @@ class Remote(MenuItem):
         if not remoteHost:
             dbg("cannot determine host for manually-started session, skipping command")
             return
+        dbg(f"manually-started remote session detected on pid={child.pid}, "
+            f"host '{remoteHost}'")
         host_config = self._get_host_config(remoteHost)
         command = host_config.get('command', '')
         if not command:
+            dbg(f"no 'command' in host config for '{remoteHost}', "
+                f"nothing to send")
             return
 
         delay = float(host_config.get('command_delay', 1.0))
-        vte = terminal.get_vte()
         dbg(f"Manually-started session detected for '{remoteHost}', will send command '{command}' after {delay}s")
         Remote.sent_host_commands.add(terminal)
-        self._send_delayed_command(vte, command, int(delay * 1000))
+        self._send_delayed_command(terminal, command, int(delay * 1000))
 
     def _ssh_to_host(self, terminal: Any, host: str) -> None:
         """Send ssh command to terminal, optionally followed by a post-connect command"""
@@ -1167,17 +1664,22 @@ class Remote(MenuItem):
         ssh_exe = self._get_config()['ssh_command']
         cmd = f"{ssh_exe} {host}\n"
         dbg(f"Sending '{cmd.strip()}' to terminal")
+        host_config = self._get_host_config(host)
+        dbg(f"host config for '{host}': "
+            f"command={host_config.get('command', '')!r}, "
+            f"command_delay={host_config.get('command_delay', '<default>')!r}, "
+            f"password_command={'set' if host_config.get('password_command') else 'not set'}")
         vte.feed_child(cmd.encode())
 
         # Check host config for a post-connect command
-        host_config = self._get_host_config(host)
         command = host_config.get('command', '')
         if command:
             delay = float(host_config.get('command_delay', 1.0))
             dbg(f"Will send command '{command}' after {delay}s (host config for '{host}')")
-            self._send_delayed_command(vte, command, int(delay * 1000))
+            self._send_delayed_command(terminal, command, int(delay * 1000))
             # Mark as sent so the poller doesn't double-send when it detects the SSH process
             Remote.sent_host_commands.add(terminal)
+            dbg(f"marked terminal as host-command-scheduled (pid={terminal.pid})")
 
     def _attach_to_container(self, terminal: Any, name: str) -> None:
         """Send exec command to terminal using configured shell, optionally followed by a post-connect command"""
@@ -1195,7 +1697,7 @@ class Remote(MenuItem):
         if command:
             delay = float(host_config.get('command_delay', 1.0))
             dbg(f"Will send command '{command}' after {delay}s (host config for '{name}')")
-            self._send_delayed_command(vte, command, int(delay * 1000))
+            self._send_delayed_command(terminal, command, int(delay * 1000))
             # Mark as sent so the poller doesn't double-send when it detects the container process
             Remote.sent_host_commands.add(terminal)
 
@@ -1450,7 +1952,7 @@ class Remote(MenuItem):
             # No cd to send — just schedule the post-connect command if any
             if host_command:
                 dbg(f"Will send command '{host_command}' after {host_command_delay}s (host config for '{remoteHost}')")
-                self._send_delayed_command(vte, host_command, command_delay_ms)
+                self._send_delayed_command(terminal, host_command, command_delay_ms)
         elif command_before_cd and host_command:
             # Command first, then cd
             # 1. Wait command_delay → send command
@@ -1475,7 +1977,7 @@ class Remote(MenuItem):
             def send_cd_then_command() -> bool:
                 vte.feed_child(snippet.encode())
                 remaining_delay = max(0, command_delay_ms - cd_delay_ms)
-                self._send_delayed_command(vte, host_command, remaining_delay)
+                self._send_delayed_command(terminal, host_command, remaining_delay)
                 return False
             GLib.timeout_add(cd_delay_ms, send_cd_then_command)
         else:
