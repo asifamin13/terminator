@@ -129,12 +129,12 @@ import http.client
 import psutil
 import asyncio
 import threading
-from typing import Optional, List
+from typing import Any, Dict, Optional, List, Set, Tuple, Union
 
 import gi
-from gi.repository import Gtk, GLib, Gdk
+from gi.repository import Gtk, GLib, Gdk  # type: ignore
 gi.require_version('Vte', '2.91')
-from gi.repository import Vte
+from gi.repository import Vte  # type: ignore
 
 from terminatorlib.plugin import MenuItem
 from terminatorlib.config import Config
@@ -192,22 +192,22 @@ class DockerAPI(object):
     Docker and Podman (Podman exposes a Docker-compatible API socket).
     Falls back gracefully when no API socket is accessible.
     """
-    _instance = None
+    _instance: Optional['DockerAPI'] = None
 
     @classmethod
-    def get_instance(cls):
+    def get_instance(cls) -> 'DockerAPI':
         """Get the singleton DockerAPI instance"""
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
 
-    def __init__(self):
-        self._socket = None  # path of the working socket
+    def __init__(self) -> None:
+        self._socket: Optional[str] = None  # path of the working socket
         self._tried_connect = False
-        self.socket_path = None
+        self.socket_path: Optional[str] = None
 
     @staticmethod
-    def _candidate_sockets(configured):
+    def _candidate_sockets(configured: Optional[str]) -> List[str]:
         """ ordered list of socket paths to try """
         uid = os.getuid()
         candidates = []
@@ -237,7 +237,7 @@ class DockerAPI(object):
 
         return candidates
 
-    def _request(self, path):
+    def _request(self, path: str) -> Optional[Tuple[int, bytes]]:
         """ GET `path` from the API socket, return (status, body) or None """
         if not self._socket:
             return None
@@ -252,7 +252,7 @@ class DockerAPI(object):
         finally:
             conn.close()
 
-    def _get_json(self, path):
+    def _get_json(self, path: str) -> Optional[Any]:
         """ GET `path` and parse the JSON body, or None on any failure """
         ret = self._request(path)
         if not ret:
@@ -267,7 +267,7 @@ class DockerAPI(object):
             dbg(f"bad JSON from {path}: {e}")
             return None
 
-    def _connect(self):
+    def _connect(self) -> Optional['DockerAPI']:
         """
         Find a working Docker/Podman API socket.
         Returns self when an API is available, else None (so callers can
@@ -292,7 +292,7 @@ class DockerAPI(object):
         dbg("No container API socket available")
         return None
 
-    def list_containers(self):
+    def list_containers(self) -> List[Dict[str, Any]]:
         """
         List running containers via GET /containers/json.
         Returns list of dicts with 'name', 'image', 'created' keys
@@ -312,7 +312,7 @@ class DockerAPI(object):
             })
         return containers
 
-    def get_container_info(self, name_or_id):
+    def get_container_info(self, name_or_id: str) -> Optional[Dict[str, Any]]:
         """
         Inspect a container via GET /containers/{name}/json.
         Returns dict with 'name', 'working_dir' keys, or None if not found.
@@ -332,7 +332,7 @@ class RemoteSession(object):
     """
     API representing a 'Remote Session'
     """
-    def __init__(self, exe):
+    def __init__(self, exe: str) -> None:
         """
         constructor, exe acts like our type
         """
@@ -385,7 +385,9 @@ class SSHSession(RemoteSession):
         RemoteSession.__init__(self, exe)
 
     @classmethod
-    def _parse_ssh_args(cls, proc):
+    def _parse_ssh_args(
+        cls, proc: psutil.Process
+    ) -> Tuple[Optional[List[Tuple[str, str]]], Optional[List[str]]]:
         """
         Parse ssh cmdline into (opts, args) using getopt.
         Returns (opts, args) or (None, None) on error.
@@ -402,13 +404,13 @@ class SSHSession(RemoteSession):
             dbg(f"caught error parsing ssh args: {e}")
         return None, None
 
-    def IsType(self, proc):
+    def IsType(self, proc: psutil.Process) -> bool:
         """ check if this is an interactive ssh session """
         if not self.matches_by_name(proc):
             return False
         return not self._is_transport_ssh(proc)
 
-    def _is_transport_ssh(self, proc):
+    def _is_transport_ssh(self, proc: psutil.Process) -> bool:
         """
         Detect non-interactive ssh processes used as transport by
         rsync/scp/sftp/etc. so we don't treat them as interactive sessions.
@@ -432,7 +434,7 @@ class SSHSession(RemoteSession):
             # this is a non-interactive one-shot (e.g. `ssh host "ls"`, rsync's
             # `ssh host rsync --server ...`).
             opts, args = self._parse_ssh_args(proc)
-            if opts is None:
+            if opts is None or args is None:
                 # parse failed (proc gone or bad cmdline) — assume transport to
                 # be safe and avoid injecting into something we can't understand
                 return True
@@ -454,11 +456,11 @@ class SSHSession(RemoteSession):
             return False
         return False
 
-    def GetHost(self, proc):
+    def GetHost(self, proc: psutil.Process) -> Optional[str]:
         """
         extract host from ssh command line
         """
-        def extractHost(target):
+        def extractHost(target: str) -> str:
             if '@' in target:
                 return target.split('@')[1]
             return target
@@ -468,13 +470,13 @@ class SSHSession(RemoteSession):
             return extractHost(args[0])
         return None
 
-    def Clone(self, proc):
+    def Clone(self, proc: psutil.Process) -> List[str]:
         """ ssh just needs to copy the cmdline """
         return proc.cmdline()
 
 class ContainerSession(RemoteSession):
     """ container type sessions """
-    def __init__(self, exe):
+    def __init__(self, exe: str = 'docker') -> None:
         """ constructor """
         super().__init__(exe)
         # Pre-create ArgumentParser instances to avoid rebuilding on every call
@@ -482,7 +484,7 @@ class ContainerSession(RemoteSession):
         self._attach_parser = self._create_attach_parser()
 
     @staticmethod
-    def _create_exec_parser():
+    def _create_exec_parser() -> argparse.ArgumentParser:
         """ pre-create the exec argument parser """
         parser = argparse.ArgumentParser()
         parser.add_argument("container")
@@ -501,7 +503,7 @@ class ContainerSession(RemoteSession):
         return parser
 
     @staticmethod
-    def _create_attach_parser():
+    def _create_attach_parser() -> argparse.ArgumentParser:
         """ pre-create the attach argument parser """
         parser = argparse.ArgumentParser()
         parser.add_argument("container")
@@ -511,14 +513,14 @@ class ContainerSession(RemoteSession):
         parser.add_argument('--sig-proxy', action='store_true')
         return parser
 
-    def IsType(self, proc):
+    def IsType(self, proc: psutil.Process) -> bool:
         """ check if this is a running docker session """
         if not self.matches_by_name(proc):
             return False
         # make sure this is an interactive run, exec, or attach
         return self._get_command(proc) != None
 
-    def GetHost(self, proc):
+    def GetHost(self, proc: psutil.Process) -> Optional[str]:
         """ try to find container name from cmdline """
         # TODO: figure this out
         cmd = self._get_command(proc)
@@ -538,7 +540,7 @@ class ContainerSession(RemoteSession):
             err(f"caught exception {e}")
         return None
 
-    def Clone(self, proc, shell=None):
+    def Clone(self, proc: psutil.Process, shell: Optional[str] = None) -> List[str]:  # type: ignore[override]
         """ get cmd to launch terminal into container session """
         if shell is None:
             shell = 'sh'
@@ -559,7 +561,7 @@ class ContainerSession(RemoteSession):
             clone_cmd = [self.exe, 'exec', '-it', host] + shell.split()
             return clone_cmd
 
-    def _get_command(self, proc):
+    def _get_command(self, proc: psutil.Process) -> Optional[str]:
         """ get type of container command, we only support interactive ones """
         interactiveCmds = { 'run', 'exec', 'attach' }
         try:
@@ -572,7 +574,7 @@ class ContainerSession(RemoteSession):
             err(f"unhandled exception: {e}")
         return None
 
-    def _get_host_run(self, proc):
+    def _get_host_run(self, proc: psutil.Process) -> Optional[str]:
         """
         docker/podman run — try to find the container name.
         1. Check for --name in cmdline
@@ -613,7 +615,7 @@ class ContainerSession(RemoteSession):
         dbg("Could not determine container name for run command")
         return None
 
-    def _get_host_exec(self, proc):
+    def _get_host_exec(self, proc: psutil.Process) -> Optional[str]:
         """
         get container name from docker exec cmdline
         FORMAT: podman exec [options] CONTAINER [COMMAND [ARG...]]
@@ -637,7 +639,7 @@ class ContainerSession(RemoteSession):
         # dbg(f"got args: {args}, unknown: {unknown}")
         return args.container
 
-    def _get_host_attach(self, proc):
+    def _get_host_attach(self, proc: psutil.Process) -> Optional[str]:
         """
         get container name from docker attach
         FORMAT: podman attach [options] container
@@ -670,19 +672,23 @@ class RemoteProcWatch(object):
     """
     cache current remote sessions
     """
-    def __init__(self, session_types, poll_rate=0.5) -> None:
+    def __init__(self, session_types: List[RemoteSession], poll_rate: float = 0.5) -> None:
         """ constructor """
         self.remote_session_types = session_types
         self.poll_rate = poll_rate
-        self.watches = dict() # pid -> None or (psutil.Process, RemoteSession)
-        self.create_times = dict() # pid -> create_time (cached to avoid syscalls on UI thread)
+        # pid -> None or (psutil.Process, RemoteSession)
+        self.watches: Dict[int, Optional[Tuple[psutil.Process, 'RemoteSession']]] = dict()
+        # pid -> create_time (cached to avoid syscalls on UI thread)
+        self.create_times: Dict[int, Optional[float]] = dict()
         self._lock = threading.Lock()
 
         self.quit = False
-        self.loop = None
-        self.thread = None
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self.thread: Optional[threading.Thread] = None
 
-    def _has_remote_session(self, pid):
+    def _has_remote_session(
+        self, pid: int
+    ) -> Optional[Tuple[psutil.Process, 'RemoteSession']]:
         """ check if this PID has a direct child with remote session """
         # Try non-recursive first (cheap) — ssh/docker are typically direct children
         children = psutil.Process(pid).children(recursive=False)
@@ -704,7 +710,7 @@ class RemoteProcWatch(object):
                         return (child, remote_session)
         return None
 
-    def Register(self, pid):
+    def Register(self, pid: int) -> None:
         """ watch PID for children """
         with self._lock:
             if pid in self.watches:
@@ -718,7 +724,7 @@ class RemoteProcWatch(object):
                 self.create_times[pid] = None
         self._ensure_thread()
 
-    def _ensure_thread(self):
+    def _ensure_thread(self) -> None:
         """
         (re)start the poll thread if it isn't running.
         A threading.Thread object can only be started once, so if a
@@ -732,19 +738,21 @@ class RemoteProcWatch(object):
         self.thread = threading.Thread(target=self._external_thread, daemon=True)
         self.thread.start()
 
-    def GetPIDProcInfo(self, pid):
+    def GetPIDProcInfo(
+        self, pid: int
+    ) -> Optional[Tuple[psutil.Process, 'RemoteSession']]:
         """ get current remote proc info """
         with self._lock:
             if pid not in self.watches:
                 return None
             return self.watches[pid]
 
-    def GetCreateTime(self, pid):
+    def GetCreateTime(self, pid: int) -> Optional[float]:
         """ get cached create_time for pid, avoiding syscall on UI thread """
         with self._lock:
             return self.create_times.get(pid)
 
-    async def _poll(self):
+    async def _poll(self) -> None:
         """ check psutil proc info """
         while not self.quit:
             with self._lock:
@@ -775,15 +783,21 @@ class RemoteProcWatch(object):
                     break
             await asyncio.sleep(self.poll_rate)
 
-    async def _async_main(self):
+    async def _async_main(self) -> None:
         """ async stuff """
-        task = self.loop.create_task(self._poll())
+        loop = self.loop
+        if loop is None:
+            return
+        task = loop.create_task(self._poll())
         await task
 
-    def _external_thread(self):
+    def _external_thread(self) -> None:
         """ external event loop """
-        self.loop.run_until_complete(self._async_main())
-        self.loop.close()
+        loop = self.loop
+        if loop is None:
+            return
+        loop.run_until_complete(self._async_main())
+        loop.close()
 
 class Remote(MenuItem):
     """
@@ -804,16 +818,16 @@ class Remote(MenuItem):
 
     # ---- shared (class-level) state, singletons across plugin instances ----
     # global plugin config
-    config = None
+    config: Optional[Dict[str, Any]] = None
     # single proc watch poller shared by all instances
-    remote_proc_watch = None
+    remote_proc_watch: Optional[RemoteProcWatch] = None
     # current terminals with a remote session found via polling
-    currRemoteTerminals = dict() # terminal -> last profile
+    currRemoteTerminals: Dict[Any, Any] = dict() # terminal -> last profile
     # terminals that have already received a host command (prevents double-sending
     # when the dropdown menu already scheduled one before the poller detects it)
-    sent_host_commands = set()
+    sent_host_commands: Set[Any] = set()
     # single GLib watch timer shared by all instances
-    watch_id = None
+    watch_id: Optional[int] = None
 
     # I hate using regex, got this from ChatGPT 3.5
     # This should try to match a sane linux file path that can
@@ -822,27 +836,25 @@ class Remote(MenuItem):
         r'(\/(?:[\w.-]+\/)*[\w.-]+|\~(?:\/[\w.-]+)*)+(?:\.\w+)?'
     )
 
-    def __init__(self):
+    def __init__(self) -> None:
         """ constructor """
         MenuItem.__init__(self)
         dbg("Remote instance created")
 
-        if not Remote.config:
-            Remote.config = Remote.get_config()
-            dbg(f"using config: {self.config}")
+        config = Remote._get_config()
+        dbg(f"using config: {config}")
 
         self.terminator = Terminator()
 
         # current terminal instance data
-        self.peers = set()
-        self.remote_proc = None
-        self.remote_type = None
-        self.remote_cwd = None
-        self.timeout_id = None
+        self.peers: Set[Any] = set()
+        self.remote_proc: Optional[psutil.Process] = None
+        self.remote_type: Optional[RemoteSession] = None
+        self.remote_cwd: Optional[str] = None
+        self.timeout_id: Optional[Union[bool, int]] = None
 
         # Proc watch poller — create exactly once
-        if Remote.remote_proc_watch is None:
-            Remote.remote_proc_watch = RemoteProcWatch(self.remote_session_types)
+        Remote._get_proc_watch()
 
         # Watch timer + one-time API pre-connect — install exactly once
         if Remote.watch_id is None:
@@ -855,24 +867,25 @@ class Remote(MenuItem):
             # Pre-connect to Docker/Podman API at plugin load time
             # so the first right-click menu doesn't have a delay
             api = DockerAPI.get_instance()
-            socket_path = self.config.get('socket_path', '')
+            socket_path = config.get('socket_path', '')
             if socket_path:
                 api.socket_path = socket_path
             api._connect()
 
-    def _isNewlySpawned(self, pid):
-        create_time = self.remote_proc_watch.GetCreateTime(pid)
+    def _isNewlySpawned(self, pid: int) -> bool:
+        create_time = Remote._get_proc_watch().GetCreateTime(pid)
         if create_time is None:
             return False
         return abs(time.time() - create_time) < 3
 
-    def _update_watches(self, _):
+    def _update_watches(self, _data: Any = None) -> bool:
         """
         Watch for new terminals in background
         """
-        for terminal in self.terminator.terminals:
-            self.remote_proc_watch.Register(terminal.pid)
-            ret = self.remote_proc_watch.GetPIDProcInfo(terminal.pid)
+        proc_watch = Remote._get_proc_watch()
+        for terminal in (self.terminator.terminals or []):
+            proc_watch.Register(terminal.pid)
+            ret = proc_watch.GetPIDProcInfo(terminal.pid)
             if ret:
                 child, remoteType = ret
                 if terminal not in self.currRemoteTerminals:
@@ -891,9 +904,9 @@ class Remote(MenuItem):
         return True
 
     @classmethod
-    def get_config(cls):
+    def get_config(cls) -> Dict[str, Any]:
         """ return configuration dict, ensure we have proper keys """
-        config = {
+        config: Dict[str, Any] = {
             'ssh_default_profile': "",
             'container_default_profile': "",
             'auto_clone': "False",
@@ -911,17 +924,41 @@ class Remote(MenuItem):
         if user_config:
             config.update(user_config)
 
-        def get_as_bool(config, key):
+        def get_as_bool(cfg: Dict[str, Any], key: str) -> None:
             try:
-                config[key] = config[key].lower() == 'true'
+                cfg[key] = str(cfg[key]).lower() == 'true'
             except Exception as e:
                 err(f"problem parsing {key} as bool: {e}")
-                config[key] = False
+                cfg[key] = False
 
         get_as_bool(config, 'auto_clone')
         get_as_bool(config, 'infer_cwd')
         get_as_bool(config, 'use_pwd')
         return config
+
+    @classmethod
+    def _get_config(cls) -> Dict[str, Any]:
+        """ return the shared config dict, loading it on first use """
+        if cls.config is None:
+            cls.config = cls.get_config()
+        return cls.config
+
+    @classmethod
+    def _get_proc_watch(cls) -> RemoteProcWatch:
+        """ return the shared proc watch poller, creating it on first use """
+        if cls.remote_proc_watch is None:
+            cls.remote_proc_watch = RemoteProcWatch(cls.remote_session_types)
+        return cls.remote_proc_watch
+
+    @classmethod
+    def _get_host_config(cls, host: str) -> Dict[str, Any]:
+        """
+        return the per-host/container config section.
+        Configobj may hand us a plain string instead of a section, so
+        anything that isn't a dict is treated as "no host specific config".
+        """
+        entry = cls._get_config().get(host, {})
+        return entry if isinstance(entry, dict) else {}
 
     def _get_cwd_from_lines(self, terminal, N=3):
         """
@@ -1054,7 +1091,7 @@ class Remote(MenuItem):
             except Exception as e:
                 dbg(f"Error parsing SSH config {filepath}: {e}")
 
-        parse_file(self.config['ssh_config'])
+        parse_file(self._get_config()['ssh_config'])
         hosts.sort()
         return hosts
 
@@ -1113,7 +1150,7 @@ class Remote(MenuItem):
         if not remoteHost:
             dbg("cannot determine host for manually-started session, skipping command")
             return
-        host_config = self.config.get(remoteHost, {})
+        host_config = self._get_host_config(remoteHost)
         command = host_config.get('command', '')
         if not command:
             return
@@ -1124,16 +1161,16 @@ class Remote(MenuItem):
         Remote.sent_host_commands.add(terminal)
         self._send_delayed_command(vte, command, int(delay * 1000))
 
-    def _ssh_to_host(self, terminal, host):
+    def _ssh_to_host(self, terminal: Any, host: str) -> None:
         """Send ssh command to terminal, optionally followed by a post-connect command"""
         vte = terminal.get_vte()
-        ssh_exe = self.config['ssh_command']
+        ssh_exe = self._get_config()['ssh_command']
         cmd = f"{ssh_exe} {host}\n"
         dbg(f"Sending '{cmd.strip()}' to terminal")
         vte.feed_child(cmd.encode())
 
         # Check host config for a post-connect command
-        host_config = self.config.get(host, {})
+        host_config = self._get_host_config(host)
         command = host_config.get('command', '')
         if command:
             delay = float(host_config.get('command_delay', 1.0))
@@ -1142,17 +1179,18 @@ class Remote(MenuItem):
             # Mark as sent so the poller doesn't double-send when it detects the SSH process
             Remote.sent_host_commands.add(terminal)
 
-    def _attach_to_container(self, terminal, name):
+    def _attach_to_container(self, terminal: Any, name: str) -> None:
         """Send exec command to terminal using configured shell, optionally followed by a post-connect command"""
         vte = terminal.get_vte()
-        shell = self.config['container_shell']
-        container_exe = self.config['container_command']
+        config = self._get_config()
+        shell = config['container_shell']
+        container_exe = config['container_command']
         cmd = f"{container_exe} exec -it {name} {shell}\n"
         dbg(f"Sending '{cmd.strip()}' to terminal")
         vte.feed_child(cmd.encode())
 
         # Check container host config for a post-connect command
-        host_config = self.config.get(name, {})
+        host_config = self._get_host_config(name)
         command = host_config.get('command', '')
         if command:
             delay = float(host_config.get('command_delay', 1.0))
@@ -1161,10 +1199,10 @@ class Remote(MenuItem):
             # Mark as sent so the poller doesn't double-send when it detects the container process
             Remote.sent_host_commands.add(terminal)
 
-    def callback(self, menuitems, menu, terminal):
+    def callback(self, menuitems: List[Any], menu: Any, terminal: Any) -> None:
         """ Add our menu items to the menu """
 
-        def get_image_menuitem(title, horiz):
+        def get_image_menuitem(title: str, horiz: bool) -> Any:
             item = Gtk.ImageMenuItem.new_with_mnemonic(title)
             image = Gtk.Image()
             image.set_from_icon_name(
@@ -1177,7 +1215,7 @@ class Remote(MenuItem):
             return item
 
         # Check for existing remote session
-        ret = self.remote_proc_watch.GetPIDProcInfo(terminal.pid)
+        ret = Remote._get_proc_watch().GetPIDProcInfo(terminal.pid)
 
         if not ret:
             # No remote session — show options to launch new sessions
@@ -1270,7 +1308,7 @@ class Remote(MenuItem):
 
         # toggle to use pwd for CWD detection instead of regex
         item = Gtk.CheckMenuItem(_('Use pwd for CWD'))
-        item.set_active(self.config['use_pwd'])
+        item.set_active(self._get_config()['use_pwd'])
         item.connect(
             'toggled',
             self._on_use_pwd,
@@ -1280,7 +1318,7 @@ class Remote(MenuItem):
 
         # add option to clone on split
         item = Gtk.CheckMenuItem(_('Clone On Split'))
-        item.set_active(self.config['auto_clone'])
+        item.set_active(self._get_config()['auto_clone'])
         item.connect(
             'toggled',
             self._on_clone_on_split,
@@ -1289,7 +1327,7 @@ class Remote(MenuItem):
         menuitems.append(item)
 
         # find the split items and add our clone handlers when they finish
-        if self.config['auto_clone']:
+        if self._get_config()['auto_clone']:
             self.peers = self._get_all_terminals()
             for child in menu.get_children():
                 if 'split' in child.get_name():
@@ -1298,13 +1336,13 @@ class Remote(MenuItem):
                         'activate', self._split_axis, terminal
                     )
 
-    def _on_clone_on_split(self, widget, data):
+    def _on_clone_on_split(self, widget: Any, _data: Any = None) -> None:
         """ handle check text box """
-        self.config['auto_clone'] = widget.get_active()
+        self._get_config()['auto_clone'] = widget.get_active()
 
-    def _on_use_pwd(self, widget, data):
+    def _on_use_pwd(self, widget: Any, _data: Any = None) -> None:
         """ handle use pwd toggle """
-        self.config['use_pwd'] = widget.get_active()
+        self._get_config()['use_pwd'] = widget.get_active()
 
     def _menu_item_activated_into(self, _, args):
         """
@@ -1314,7 +1352,7 @@ class Remote(MenuItem):
         """
         signal, terminal, cwd_path = args
 
-        ret = self.remote_proc_watch.GetPIDProcInfo(terminal.pid)
+        ret = Remote._get_proc_watch().GetPIDProcInfo(terminal.pid)
         if not ret:
             err("lost remote session seen on context menu?")
             return
@@ -1358,45 +1396,54 @@ class Remote(MenuItem):
         dbg("polling for new terminals...")
         return True
 
-    def _get_all_terminals(self):
+    def _get_all_terminals(self) -> Set[Any]:
         """ get all unique terminal instances """
-        peers = set()
+        peers: Set[Any] = set()
         try:
-            peers = { x.uuid for x in self.terminator.terminals }
+            peers = { x.uuid for x in (self.terminator.terminals or []) }
         except Exception as e:
             err(f"caught exception getting terminals: {e}")
         return peers
 
-    def _spawn_remote_session(self, terminal):
+    def _spawn_remote_session(self, terminal: Any) -> None:
         """ spawn user session into terminal """
-        if isinstance(self.remote_type, ContainerSession):
-            remote_cmd = self.remote_type.Clone(
-                self.remote_proc,
-                shell=self.config['container_shell']
+        remote_type = self.remote_type
+        remote_proc = self.remote_proc
+        if remote_type is None or remote_proc is None:
+            err("no remote session to clone, skipping")
+            return
+
+        config = self._get_config()
+        if isinstance(remote_type, ContainerSession):
+            remote_cmd = remote_type.Clone(
+                remote_proc,
+                shell=config['container_shell']
             )
         else:
-            remote_cmd = self.remote_type.Clone(self.remote_proc)
+            remote_cmd = remote_type.Clone(remote_proc)
 
         spawn_cmd = " ".join(remote_cmd) # get as full string, not list of strings
         cmd = f"{spawn_cmd}{os.linesep}" # make sure we press "enter"
-        
+
         dbg(f"will launch '{cmd}' into new terminal")
         vte = terminal.get_vte()
         vte.feed_child(cmd.encode())
 
         # Check host config for a post-connect command
-        remoteHost = self.remote_type.GetHost(self.remote_proc)
+        remoteHost = remote_type.GetHost(remote_proc)
         host_command = None
         host_command_delay = 1.0
         command_before_cd = True
-        if remoteHost and remoteHost in self.config:
-            host_config = self.config[remoteHost]
+        if remoteHost:
+            host_config = self._get_host_config(remoteHost)
             host_command = host_config.get('command', '')
             host_command_delay = float(host_config.get('command_delay', 1.0))
-            command_before_cd = host_config.get('command_before_cd', 'true').lower() == 'true'
+            command_before_cd = str(
+                host_config.get('command_before_cd', 'true')
+            ).lower() == 'true'
 
         has_cd = self.remote_cwd not in (None, "", "~")
-        cd_delay_ms = int(float(self.config['cd_delay']) * 1000)
+        cd_delay_ms = int(float(config['cd_delay']) * 1000)
         command_delay_ms = int(host_command_delay * 1000)
 
         if not has_cd:
@@ -1409,10 +1456,10 @@ class Remote(MenuItem):
             # 1. Wait command_delay → send command
             # 2. Wait cd_delay → send cd
             dbg(f"Will send command '{host_command}' after {host_command_delay}s, then cd after {cd_delay_ms}ms more (host config for '{remoteHost}')")
-            def send_command_then_cd():
+            def send_command_then_cd() -> bool:
                 vte.feed_child(f"{host_command}\n".encode())
                 snippet = CD_CMD.format(cwd=self.remote_cwd) + os.linesep
-                def send_cd():
+                def send_cd() -> bool:
                     dbg(f"Sending cd after command")
                     vte.feed_child(snippet.encode())
                     return False
@@ -1425,7 +1472,7 @@ class Remote(MenuItem):
             # 2. Wait remaining command_delay → send command
             snippet = CD_CMD.format(cwd=self.remote_cwd) + os.linesep
             dbg(f"Will send cd after {cd_delay_ms}ms, then command '{host_command}' after {command_delay_ms}ms more (host config for '{remoteHost}')")
-            def send_cd_then_command():
+            def send_cd_then_command() -> bool:
                 vte.feed_child(snippet.encode())
                 remaining_delay = max(0, command_delay_ms - cd_delay_ms)
                 self._send_delayed_command(vte, host_command, remaining_delay)
@@ -1435,7 +1482,7 @@ class Remote(MenuItem):
             # Only cd, no command
             snippet = CD_CMD.format(cwd=self.remote_cwd) + os.linesep
             dbg(f"will send snippet '{snippet}' into new terminal after {cd_delay_ms}ms")
-            def send_later():
+            def send_later() -> bool:
                 vte.feed_child(snippet.encode())
                 return False
             GLib.timeout_add(cd_delay_ms, send_later)
@@ -1446,21 +1493,31 @@ class Remote(MenuItem):
 
         self._apply_host_settings(terminal)
 
-    def _get_default_profile(self, remote_type):
+    def _get_default_profile(self, remote_type: Optional[RemoteSession]) -> str:
         """
         get default profile from config
         maybe more useful in the future...
         """
+        config = self._get_config()
         if isinstance(remote_type, SSHSession):
-            return self.config['ssh_default_profile']
+            return config['ssh_default_profile']
         if isinstance(remote_type, ContainerSession):
-            return self.config['container_default_profile']
+            return config['container_default_profile']
         return ''
 
-    def _apply_host_settings(self, terminal, proc=None, proc_type=None):
+    def _apply_host_settings(
+        self,
+        terminal: Any,
+        proc: Optional[psutil.Process] = None,
+        proc_type: Optional[RemoteSession] = None
+    ) -> None:
         """ setup terminal if host is in config """
         remote_proc = self.remote_proc if proc is None else proc
         remote_type = self.remote_type if proc_type is None else proc_type
+
+        if remote_proc is None or remote_type is None:
+            dbg("no remote session to apply host settings for, skipping")
+            return
 
         # Guard: skip if process is terminated
         try:
@@ -1478,11 +1535,8 @@ class Remote(MenuItem):
         remoteHost = remote_type.GetHost(remote_proc)
         if not remoteHost:
             dbg(f"cannot determine host for proc {remote_proc}")
-        elif remoteHost not in self.config:
-            # dbg(f"no host entry for {remoteHost}")
-            pass
         else:
-            hostSettings = self.config[remoteHost]
+            hostSettings = self._get_host_config(remoteHost)
             if 'profile' in hostSettings:
                 profile = hostSettings['profile']
             # else:
@@ -1502,12 +1556,12 @@ class Remote(MenuItem):
         """ handle upstream split command, called AFTER default handler """
         dbg(f"handling split on terminal {terminal}!")
         # make sure original terminal still has remote session
-        ret = self.remote_proc_watch.GetPIDProcInfo(terminal.pid)
+        ret = Remote._get_proc_watch().GetPIDProcInfo(terminal.pid)
         if not ret:
             err("lost remote session seen on context menu?")
             return
         self.remote_proc, self.remote_type = ret
-        if self.config['infer_cwd']:
+        if self._get_config()['infer_cwd']:
             self.remote_cwd = self._get_cwd_from_lines(terminal)
         self._apply_host_settings(terminal)
 
@@ -1551,7 +1605,7 @@ class Remote(MenuItem):
         """
         signal, terminal = args
 
-        ret = self.remote_proc_watch.GetPIDProcInfo(terminal.pid)
+        ret = Remote._get_proc_watch().GetPIDProcInfo(terminal.pid)
         if not ret:
             err("lost remote session seen on context menu?")
             return
@@ -1559,14 +1613,14 @@ class Remote(MenuItem):
         if not self.timeout_id: # check if we are already waiting
             self.remote_proc = child
             self.remote_type = remoteType
-            if self.config['use_pwd']:
+            if self._get_config()['use_pwd']:
                 # Use pwd for CWD detection (requires idle shell)
                 self.timeout_id = True  # sentinel to prevent re-entry
                 self._get_cwd_via_pwd(
                     terminal,
                     lambda cwd: self._continue_clone(signal, terminal, cwd)
                 )
-            elif self.config['infer_cwd']:
+            elif self._get_config()['infer_cwd']:
                 remote_cwd = self._get_cwd_from_lines(terminal)
                 self._continue_clone(signal, terminal, remote_cwd)
             else:
