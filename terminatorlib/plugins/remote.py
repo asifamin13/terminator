@@ -108,7 +108,8 @@ CONFIGURATION
       [[Remote]]
 
     Configuration keys:
-      * auto_clone: Clone automatically when you split a remote session (False)
+      * auto_clone: Clone automatically when you split a remote session,
+        via keybind (split_horizontal etc.) or context menu (False)
       * infer_cwd: When cloned, parse CWD from PS1 and `cd` into it (True)
       * use_pwd: When set (via menu toggle), send `pwd` to the remote shell to
         determine CWD instead of regex-matching the PS1 (False)
@@ -929,6 +930,11 @@ class Remote(MenuItem):
     # terminals that have already received a host command (prevents double-sending
     # when the dropdown menu already scheduled one before the poller detects it)
     sent_host_commands: Set[Any] = set()
+    # terminals with split signals connected for clone-on-split
+    split_hooked: Set[Any] = set()
+    # True while our own clone flow emits a split signal (its _poll_new_terminals
+    # does the spawning — the split-signal handler must not also clone)
+    split_suppress: bool = False
     # terminal -> {'pid', 'attempts', 'armed', 'row'} state for ssh password auto-entry
     password_states: Dict[Any, Dict[str, Any]] = {}
     # alias -> (hostname, user) resolved via `ssh -G`, cached
@@ -992,7 +998,21 @@ class Remote(MenuItem):
         Watch for new terminals in background
         """
         proc_watch = Remote._get_proc_watch()
+        if self._get_config()['auto_clone']:
+            # keep a fresh snapshot so the split-signal handler can diff it
+            # against the post-split terminals to find the new one. Don't
+            # touch it while a clone poll (timeout_id) is diffing its own.
+            if not self.timeout_id:
+                self.peers = self._get_all_terminals()
         for terminal in (self.terminator.terminals or []):
+            if self._get_config()['auto_clone'] and \
+                    terminal not in Remote.split_hooked:
+                # keybind AND context-menu splits both emit these signals;
+                # connect once per terminal (RUN_LAST + connect_after means
+                # our handler runs after the split has completed)
+                for sig in ('split-auto', 'split-horiz', 'split-vert'):
+                    terminal.connect_after(sig, self._on_split_signal, terminal)
+                Remote.split_hooked.add(terminal)
             proc_watch.Register(terminal.pid)
             ret = proc_watch.GetPIDProcInfo(terminal.pid)
             if ret:
@@ -1017,7 +1037,111 @@ class Remote(MenuItem):
                     terminal.set_profile(None, profile=self.currRemoteTerminals[terminal])
                     self.currRemoteTerminals.pop(terminal)
                     Remote.sent_host_commands.discard(terminal)
+        # drop hooks for terminals that have gone away
+        Remote.split_hooked.intersection_update(self.terminator.terminals or [])
         return True
+
+    def _on_split_signal(self, widget: Any, cwd: str, terminal: Any) -> None:
+        """
+        Clone the source terminal's remote session into the newly created
+        terminal after a split. Fires for keybind splits (key_split_horiz /
+        key_split_vert / key_split_auto) and context-menu splits alike —
+        both emit the Terminal split signals. Runs after the default
+        handler, so the new terminal already exists.
+        """
+        if not self._get_config()['auto_clone']:
+            return
+        if Remote.split_suppress:
+            # our own Clone flow emitted this split to create the terminal;
+            # its _poll_new_terminals is already spawning the session
+            dbg("split signal from our own clone flow, not re-cloning")
+            return
+        # only clone when the SOURCE terminal actually has a remote session
+        # (this fires for every split of every terminal, local shells too)
+        ret = Remote._get_proc_watch().GetPIDProcInfo(terminal.pid)
+        if not ret:
+            dbg(f"split source terminal pid={terminal.pid} has no remote "
+                f"session, not cloning")
+            return
+        self.remote_proc, self.remote_type = ret
+        # find the new terminal. Prefer the split sibling: split_axis makes
+        # the source terminal's parent a fresh Paned holding exactly source
+        # + sibling. The peers diff is only a fallback, because split_axis
+        # runs a nested main loop (Gtk.main_iteration_do) in which the
+        # poller can refresh the snapshot BEFORE this handler diffs —
+        # making the new terminal look "already known".
+        newTerminal = None
+        parent = terminal.get_parent()
+        if parent is not None and hasattr(parent, 'get_child1'):
+            for child in (parent.get_child1(), parent.get_child2()):
+                if (child is not None and child is not terminal and
+                        getattr(child, 'uuid', None) is not None):
+                    newTerminal = self.terminator.find_terminal_by_uuid(
+                        child.uuid.urn
+                    )
+                    dbg(f"split clone: found new terminal via sibling "
+                        f"lookup pid={newTerminal.pid if newTerminal else '?'}")
+                    break
+        if newTerminal is None:
+            currPeers = self._get_all_terminals()
+            newPeers = [x for x in currPeers if x not in self.peers]
+            self.peers = currPeers
+            if len(newPeers) == 1:
+                newTerminal = self.terminator.find_terminal_by_uuid(
+                    newPeers[0].urn
+                )
+            else:
+                err(f"split clone: expected 1 new terminal, "
+                    f"found {len(newPeers)}")
+                return
+        if newTerminal is None:
+            err("split clone: could not identify the new terminal")
+            return
+        # resolve the CWD to cd into. use_pwd takes precedence: type `pwd`
+        # into the (idle) source session and parse the answer — the most
+        # reliable value, since the signal's cwd and the PS1 regex can both
+        # reflect the LOCAL shell instead of the remote session. Spawn the
+        # clone from the callback once the answer arrives.
+        if self._get_config()['use_pwd']:
+            dbg(f"split clone: use_pwd set, probing source session "
+                f"pid={terminal.pid} for CWD")
+            self.remote_cwd = None
+            self._get_cwd_via_pwd(
+                terminal,
+                lambda cwd: self._finish_split_clone(
+                    newTerminal, cwd, terminal
+                )
+            )
+            return
+        self._set_split_clone_cwd(cwd, terminal)
+        dbg(f"split clone: spawning remote session into new terminal "
+            f"pid={newTerminal.pid}")
+        self._spawn_remote_session(newTerminal)
+
+    def _set_split_clone_cwd(self, signal_cwd: Optional[str], terminal: Any) -> None:
+        """ pick the clone CWD: signal cwd first, then PS1 inference """
+        if signal_cwd:
+            self.remote_cwd = signal_cwd
+        elif self._get_config()['infer_cwd']:
+            self.remote_cwd = self._get_cwd_from_lines(terminal)
+        else:
+            self.remote_cwd = None
+
+    def _finish_split_clone(
+        self, newTerminal: Any, cwd: Optional[str], terminal: Any
+    ) -> bool:
+        """ continue a use_pwd split clone after the pwd answer arrives """
+        if not cwd:
+            dbg("split clone: pwd probe failed, falling back to "
+                "signal cwd / PS1 inference")
+            self._set_split_clone_cwd(None, terminal)
+        else:
+            dbg(f"split clone: got CWD via pwd: {cwd}")
+            self.remote_cwd = cwd
+        dbg(f"split clone: spawning remote session into new terminal "
+            f"pid={newTerminal.pid}")
+        self._spawn_remote_session(newTerminal)
+        return False  # GLib idle callback, run once
 
     @classmethod
     def get_config(cls) -> Dict[str, Any]:
@@ -1585,24 +1709,29 @@ class Remote(MenuItem):
             return []
 
     def _send_delayed_command(self, terminal, command, delay_ms):
-        """Send a command to the terminal after a delay
+        """Send a command to the terminal after a delay"""
+        self._send_after_delay(terminal, f"{command}\n", delay_ms)
 
-        The command is only typed once NO password prompt sits on the
-        cursor row. Typing into an active password prompt would corrupt
-        auth: the tty is in no-echo mode, so the command text (and its
-        trailing newline) is consumed by ssh as the password and
-        submitted ("Permission denied"), and the real secret fetched by
-        the auto-entry then finds no prompt left to answer. When a prompt
-        IS on the cursor row the send is re-checked every
-        PASSWORD_COMMAND_RETRY_INTERVAL ms — the prompt disappears once
-        the auto-entered (or manually typed) password is accepted — and
-        the command is sent then.
+    def _send_after_delay(self, terminal, text, delay_ms, then=None):
+        """Feed text into the terminal after delay_ms, but ONLY once no
+        password prompt sits on the cursor row.
+
+        Typing into an active password prompt would corrupt auth: the tty
+        is in no-echo mode, so the text (and its trailing newline) is
+        consumed by ssh AS the password and submitted ("Permission
+        denied"), and the real secret fetched by the auto-entry then
+        finds no prompt left to answer. When a prompt IS on the cursor
+        row the send is re-checked every PASSWORD_COMMAND_RETRY_INTERVAL
+        ms — the prompt disappears once the auto-entered (or manually
+        typed) password is accepted — at most PASSWORD_COMMAND_MAX_RETRIES
+        times before giving up. Optional `then` callback runs after the
+        text is fed (used to chain cd after the host command).
         """
         def send(retries: int = PASSWORD_COMMAND_MAX_RETRIES) -> bool:
             line, _row = self._get_prompt_line(terminal)
             if PASSWORD_PROMPT_RE.search(line):
                 if retries > 0:
-                    dbg(f"delayed command '{command}': password prompt "
+                    dbg(f"delayed send {text.strip()!r}: password prompt "
                         f"still active, deferring "
                         f"({PASSWORD_COMMAND_MAX_RETRIES - retries + 1}/"
                         f"{PASSWORD_COMMAND_MAX_RETRIES})")
@@ -1611,22 +1740,22 @@ class Remote(MenuItem):
                         lambda: send(retries - 1)
                     )
                     return False
-                dbg(f"delayed command '{command}': password prompt "
+                dbg(f"delayed send {text.strip()!r}: password prompt "
                     f"persisted too long "
-                    f"({PASSWORD_COMMAND_MAX_RETRIES} retries), "
-                    f"giving up — send it manually if needed")
+                    f"({PASSWORD_COMMAND_MAX_RETRIES} retries), giving up")
                 return False
             vte = terminal.get_vte()
             if vte is None:
-                dbg(f"delayed command '{command}': terminal has no vte, "
+                dbg(f"delayed send {text.strip()!r}: terminal has no vte, "
                     f"skipping")
                 return False
-            cmd = f"{command}\n"
-            dbg(f"Sending delayed command '{command}'")
-            vte.feed_child(cmd.encode())
+            dbg(f"Sending delayed command {text.strip()!r}")
+            vte.feed_child(text.encode())
+            if then is not None:
+                then()
             return False  # run once
         GLib.timeout_add(delay_ms, send)
-        dbg(f"scheduled delayed command '{command}' for "
+        dbg(f"scheduled delayed command {text.strip()!r} for "
             f"{delay_ms}ms from now")
 
     def _send_host_command(self, terminal, child, remote_session):
@@ -1840,15 +1969,13 @@ class Remote(MenuItem):
         )
         menuitems.append(item)
 
-        # find the split items and add our clone handlers when they finish
+        # Clone On Split is driven by the Terminal split signals
+        # (split-auto/split-horiz/split-vert), hooked in _update_watches —
+        # this covers keybind splits and context-menu splits uniformly.
+        # Prime the peers snapshot here so a split within the first poll
+        # tick still diffs correctly.
         if self._get_config()['auto_clone']:
             self.peers = self._get_all_terminals()
-            for child in menu.get_children():
-                if 'split' in child.get_name():
-                    dbg(f"handling split on menu item '{child.get_name()}'")
-                    child.connect_after(
-                        'activate', self._split_axis, terminal
-                    )
 
     def _on_clone_on_split(self, widget: Any, _data: Any = None) -> None:
         """ handle check text box """
@@ -1966,40 +2093,31 @@ class Remote(MenuItem):
                 dbg(f"Will send command '{host_command}' after {host_command_delay}s (host config for '{remoteHost}')")
                 self._send_delayed_command(terminal, host_command, command_delay_ms)
         elif command_before_cd and host_command:
-            # Command first, then cd
-            # 1. Wait command_delay → send command
-            # 2. Wait cd_delay → send cd
+            # Command first, then cd — both gated on no password prompt
             dbg(f"Will send command '{host_command}' after {host_command_delay}s, then cd after {cd_delay_ms}ms more (host config for '{remoteHost}')")
-            def send_command_then_cd() -> bool:
-                vte.feed_child(f"{host_command}\n".encode())
+            def send_cd() -> bool:
                 snippet = CD_CMD.format(cwd=self.remote_cwd) + os.linesep
-                def send_cd() -> bool:
-                    dbg(f"Sending cd after command")
-                    vte.feed_child(snippet.encode())
-                    return False
-                GLib.timeout_add(cd_delay_ms, send_cd)
+                dbg(f"Sending cd after command")
+                self._send_after_delay(terminal, snippet, 0)
                 return False
-            GLib.timeout_add(command_delay_ms, send_command_then_cd)
+            self._send_after_delay(
+                terminal, f"{host_command}\n", command_delay_ms,
+                then=lambda: GLib.timeout_add(cd_delay_ms, send_cd)
+            )
         elif host_command:
-            # Cd first, then command
-            # 1. Wait cd_delay → send cd
-            # 2. Wait remaining command_delay → send command
+            # Cd first, then command — both gated on no password prompt
             snippet = CD_CMD.format(cwd=self.remote_cwd) + os.linesep
             dbg(f"Will send cd after {cd_delay_ms}ms, then command '{host_command}' after {command_delay_ms}ms more (host config for '{remoteHost}')")
-            def send_cd_then_command() -> bool:
-                vte.feed_child(snippet.encode())
+            def send_command_later() -> bool:
                 remaining_delay = max(0, command_delay_ms - cd_delay_ms)
                 self._send_delayed_command(terminal, host_command, remaining_delay)
                 return False
-            GLib.timeout_add(cd_delay_ms, send_cd_then_command)
+            self._send_after_delay(terminal, snippet, cd_delay_ms, then=send_command_later)
         else:
             # Only cd, no command
             snippet = CD_CMD.format(cwd=self.remote_cwd) + os.linesep
             dbg(f"will send snippet '{snippet}' into new terminal after {cd_delay_ms}ms")
-            def send_later() -> bool:
-                vte.feed_child(snippet.encode())
-                return False
-            GLib.timeout_add(cd_delay_ms, send_later)
+            self._send_after_delay(terminal, snippet, cd_delay_ms)
 
         # Mark as sent so the poller doesn't double-send when it detects the cloned session
         if host_command:
@@ -2066,38 +2184,6 @@ class Remote(MenuItem):
             self.currRemoteTerminals[terminal] = terminal.get_profile()
             terminal.set_profile(None, profile=profile)
 
-    def _split_axis(self, widget, terminal):
-        """ handle upstream split command, called AFTER default handler """
-        dbg(f"handling split on terminal {terminal}!")
-        # make sure original terminal still has remote session
-        ret = Remote._get_proc_watch().GetPIDProcInfo(terminal.pid)
-        if not ret:
-            err("lost remote session seen on context menu?")
-            return
-        self.remote_proc, self.remote_type = ret
-        if self._get_config()['infer_cwd']:
-            self.remote_cwd = self._get_cwd_from_lines(terminal)
-        self._apply_host_settings(terminal)
-
-        # original split command should have finished due to our
-        # connect_after. Try to find the new terminal since we
-        # last activated the context menu.
-        currPeers = self._get_all_terminals()
-        if len(currPeers) != len(self.peers):
-            # parent container changed, get the added child
-            newPeers = [ x for x in currPeers if x not in self.peers ]
-            if not len(newPeers):
-                err("container removed children?!")
-                return False
-            dbg(f"Container has new children: {newPeers}")
-            if len(newPeers) != 1:
-                err("container has more than one child?!")
-            newTermUUID = newPeers[0]
-            newTerminal = self.terminator.find_terminal_by_uuid(newTermUUID.urn)
-            self._spawn_remote_session(newTerminal)
-        else:
-            err("cant figure out the new terminal?")
-
     def _continue_clone(self, signal, terminal, remote_cwd):
         """Continue the clone process after CWD has been determined"""
         self.remote_cwd = remote_cwd
@@ -2110,8 +2196,14 @@ class Remote(MenuItem):
             time.time()
         )
         self._apply_host_settings(terminal)
-        # launch new terminal
-        terminal.emit(signal, terminal.get_cwd())
+        # launch new terminal. Suppress the split-signal handler while we
+        # do: this emit creates the terminal and would otherwise also
+        # trigger _on_split_signal, double-spawning the session
+        Remote.split_suppress = True
+        try:
+            terminal.emit(signal, terminal.get_cwd())
+        finally:
+            Remote.split_suppress = False
 
     def _menu_item_activated(self, _, args):
         """
