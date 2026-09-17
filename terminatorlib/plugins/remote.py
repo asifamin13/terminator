@@ -86,6 +86,19 @@ PASSWORD AUTO-ENTRY
         use the same password store for every host without a per-host
         `password_command`, or per host for a specific entry path
 
+    Registered shorthands:
+
+      * pass:<path>  runs `pass <path>` (e.g. `pass:ssh/{host}`)
+      * rbw:<name>   runs `rbw get <name>` — Bitwarden via rbw, whose
+        agent keeps the vault unlocked (e.g. `rbw:ssh-{host}`)
+      * bw:<name>    runs `bw get password <name> --nointeraction` —
+        Bitwarden's official CLI; Terminator must be started with
+        BW_SESSION exported (from `bw unlock`), otherwise lookups fail
+
+    The lookup has no tty and times out after `ssh_password_timeout`
+    seconds (15), so the manager must already be unlocked (or unlock via a
+    graphical pinentry within that time) and print only the password.
+
     Shorthand support details: placeholders like {host}/{user} work in
     shorthands too, the set of managers is a small registry
     (PASSWORD_MANAGER_SHORTHANDS) — add an entry to support another
@@ -125,9 +138,12 @@ CONFIGURATION
       * ssh_password_command: command run to fetch the SSH password when ssh
         prompts for one; {host} and {user} are placeholders (default uses
         secret-tool, see PASSWORD AUTO-ENTRY below). May also be a
-        '<manager>:<path>' shorthand like 'pass:ssh/{host}' (same forms as
+        '<manager>:<path>' shorthand like 'pass:ssh/{host}' or
+        'rbw:ssh-{host}' (same forms as
         the per-host password_command). Set to "" to disable
       * ssh_password_max_attempts: max auto-entry attempts per ssh process (3)
+      * ssh_password_timeout: seconds to wait for the password command before
+        giving up and leaving the prompt for manual typing (15)
 
     Host section:
       You can add host sections (the host name from SSH config or the container
@@ -229,10 +245,11 @@ SSH_PASSWORD_PROMPT_RE = re.compile(
 # password). Prompts containing 'sudo' are additionally excluded by regex.
 SSH_PASSWORD_WINDOW = 60.0
 
-# How long to wait for a password lookup command to finish. Generous
-# enough for a cold pinentry prompt, but note a timeout is now safe
-# (stale-password guard) — it just means manual typing.
-PASSWORD_FETCH_TIMEOUT = 5.0
+# Default for `ssh_password_timeout`: how long to wait for a password
+# lookup command to finish. Generous enough for slow CLIs (the standalone
+# Bitwarden `bw` binary takes ~5s per lookup) and a cold pinentry prompt;
+# a late result is safe (stale-password guard) — it just means manual typing.
+PASSWORD_FETCH_TIMEOUT = 15.0
 
 # Delayed host commands (command_delay) must not be typed while ssh is
 # sitting on a password prompt: the tty is in no-echo mode, so the text
@@ -250,6 +267,13 @@ PASSWORD_COMMAND_MAX_RETRIES = 120
 #   'keepassxc-cli': lambda db_and_entry: [...]
 PASSWORD_MANAGER_SHORTHANDS = {
     'pass': lambda path: ['pass', path],
+    # Bitwarden via rbw (unofficial client with a background agent that
+    # keeps the vault unlocked between lookups)
+    'rbw': lambda name: ['rbw', 'get', name],
+    # Bitwarden via the official CLI; needs BW_SESSION in Terminator's
+    # environment. --nointeraction makes a locked vault fail fast instead
+    # of waiting on a master password prompt nobody can answer
+    'bw': lambda name: ['bw', 'get', 'password', name, '--nointeraction'],
 }
 
 # Cache VTE version check at module load instead of per-call
@@ -310,8 +334,7 @@ class DockerAPI(object):
         self._tried_connect = False
         self.socket_path: Optional[str] = None
 
-    @staticmethod
-    def _candidate_sockets(configured: Optional[str]) -> List[str]:
+    def _candidate_sockets(self, configured: Optional[str]) -> List[str]:
         """ ordered list of socket paths to try """
         uid = os.getuid()
         candidates = []
@@ -488,9 +511,8 @@ class SSHSession(RemoteSession):
         """ constructor """
         RemoteSession.__init__(self, exe)
 
-    @classmethod
     def _parse_ssh_args(
-        cls, proc: psutil.Process
+        self, proc: psutil.Process
     ) -> Tuple[Optional[List[Tuple[str, str]]], Optional[List[str]]]:
         """
         Parse ssh cmdline into (opts, args) using getopt.
@@ -500,7 +522,7 @@ class SSHSession(RemoteSession):
         """
         try:
             ssh_args = proc.cmdline()[1:]
-            opts, args = getopt.getopt(ssh_args, cls._ssh_short_opts)
+            opts, args = getopt.getopt(ssh_args, self._ssh_short_opts)
             return opts, args
         except psutil.NoSuchProcess:
             dbg("proc has gone away")
@@ -956,6 +978,10 @@ class Remote(MenuItem):
         MenuItem.__init__(self)
         dbg("Remote instance created")
 
+        # logged here rather than in the get_config classmethod: dbg() names
+        # the class from the first argument, which is `type` for a classmethod
+        dbg(f"read user config: "
+            f"{Config().plugin_get_config(self.__class__.__name__)}")
         config = Remote._get_config()
         dbg(f"using config: {config}")
 
@@ -1160,10 +1186,10 @@ class Remote(MenuItem):
             'socket_path': "",
             'ssh_password_command':
                 "secret-tool lookup service ssh host {host} user {user}",
-            'ssh_password_max_attempts': "3"
+            'ssh_password_max_attempts': "3",
+            'ssh_password_timeout': str(PASSWORD_FETCH_TIMEOUT)
         }
         user_config = Config().plugin_get_config(cls.__name__)
-        dbg(f"read user config: {user_config}")
         if user_config:
             config.update(user_config)
 
@@ -1239,33 +1265,39 @@ class Remote(MenuItem):
         # Send pwd command
         vte.feed_child(b'pwd\n')
 
-        def read_pwd_output():
-            newCol, newRow = vte.get_cursor_position()
-            text = vte_get_text(
-                vte_term=vte,
-                start_row=currRow,
-                start_col=currCol,
-                end_row=newRow,
-                end_col=newCol
-            )
-            cwd = None
-            if text:
-                dbg(f"pwd output text: '{text}'")
-                for line in text.split('\n'):
-                    line = line.strip()
-                    # pwd outputs the absolute path followed by a newline
-                    # take the first non-empty line
-                    if line and line != 'pwd':
-                        cwd = line
-                        break
-            if cwd:
-                dbg(f"Got CWD via pwd: {cwd}")
-            else:
-                dbg(f"Could not parse pwd output from '{text}'")
-            callback(cwd)
-            return False  # run once
+        GLib.timeout_add(
+            500, self._read_pwd_output, vte, currRow, currCol, callback
+        )
 
-        GLib.timeout_add(500, read_pwd_output)
+    def _read_pwd_output(self, vte, currRow, currCol, callback) -> bool:
+        """
+        GLib timeout callback for _get_cwd_via_pwd: parse the `pwd` output
+        printed since (currRow, currCol) and hand the CWD to callback.
+        """
+        newCol, newRow = vte.get_cursor_position()
+        text = vte_get_text(
+            vte_term=vte,
+            start_row=currRow,
+            start_col=currCol,
+            end_row=newRow,
+            end_col=newCol
+        )
+        cwd = None
+        if text:
+            dbg(f"pwd output text: '{text}'")
+            for line in text.split('\n'):
+                line = line.strip()
+                # pwd outputs the absolute path followed by a newline
+                # take the first non-empty line
+                if line and line != 'pwd':
+                    cwd = line
+                    break
+        if cwd:
+            dbg(f"Got CWD via pwd: {cwd}")
+        else:
+            dbg(f"Could not parse pwd output from '{text}'")
+        callback(cwd)
+        return False  # run once
 
     def _get_selected_path(self, terminal):
         """
@@ -1473,48 +1505,66 @@ class Remote(MenuItem):
         the terminal when it arrives. The lookup may be a '<manager>:<path>'
         shorthand (executed without a shell) or a shell command line.
         """
-        def worker() -> None:
-            password = None
-            t0 = time.time()
-            dbg(f"password lookup: worker thread started for "
-                f"'{user}@{host}' (timeout {PASSWORD_FETCH_TIMEOUT}s)")
-            try:
-                argv, shell_cmd = self._build_password_cmd(template, host, user)
-                if argv is not None:
-                    result = subprocess.run(
-                        argv, capture_output=True, text=True,
-                        timeout=PASSWORD_FETCH_TIMEOUT
-                    )
-                elif shell_cmd is not None:
-                    result = subprocess.run(
-                        shell_cmd, shell=True, capture_output=True,
-                        text=True, timeout=PASSWORD_FETCH_TIMEOUT
-                    )
-                else:  # unreachable: exactly one of argv/shell_cmd is set
-                    raise RuntimeError("password command not resolved")
-                elapsed = time.time() - t0
-                if result.returncode == 0 and result.stdout:
-                    password = result.stdout.rstrip('\r\n')
-                    dbg(f"password lookup: got secret for "
-                        f"'{user}@{host}' in {elapsed:.2f}s "
-                        f"({len(password)} chars)")
-                else:
-                    dbg(f"password command rc={result.returncode}, "
-                        f"no secret (elapsed {elapsed:.2f}s, "
-                        f"stderr: {result.stderr.strip()[:200] or 'none'})")
-            except KeyError as e:
-                err(f"unknown placeholder in password command: {e}")
-            except Exception as e:
-                dbg(f"password lookup failed after "
-                    f"{time.time() - t0:.2f}s: {e}")
-            if password:
-                GLib.idle_add(self._feed_password, terminal, password)
-                dbg(f"password lookup: dispatched typing callback "
-                    f"to UI thread for '{user}@{host}'")
+        try:
+            timeout = float(self._get_config()['ssh_password_timeout'])
+        except Exception:
+            timeout = PASSWORD_FETCH_TIMEOUT
+
+        threading.Thread(
+            target=self._password_lookup_worker,
+            args=(terminal, host, user, template, timeout),
+            daemon=True
+        ).start()
+
+    def _password_lookup_worker(
+        self, terminal: Any, host: str, user: str, template: str,
+        timeout: float
+    ) -> None:
+        """
+        Background thread body for _fetch_and_feed_password. A method rather
+        than a closure so dbg() attributes its output to Remote (and it
+        survives --debug-classes Remote).
+        """
+        password = None
+        t0 = time.time()
+        dbg(f"password lookup: worker thread started for "
+            f"'{user}@{host}' (timeout {timeout}s)")
+        try:
+            argv, shell_cmd = self._build_password_cmd(template, host, user)
+            if argv is not None:
+                result = subprocess.run(
+                    argv, capture_output=True, text=True,
+                    timeout=timeout
+                )
+            elif shell_cmd is not None:
+                result = subprocess.run(
+                    shell_cmd, shell=True, capture_output=True,
+                    text=True, timeout=timeout
+                )
+            else:  # unreachable: exactly one of argv/shell_cmd is set
+                raise RuntimeError("password command not resolved")
+            elapsed = time.time() - t0
+            if result.returncode == 0 and result.stdout:
+                password = result.stdout.rstrip('\r\n')
+                dbg(f"password lookup: got secret for "
+                    f"'{user}@{host}' in {elapsed:.2f}s "
+                    f"({len(password)} chars)")
             else:
-                dbg(f"no password found for '{user}@{host}', "
-                    f"manual typing required")
-        threading.Thread(target=worker, daemon=True).start()
+                dbg(f"password command rc={result.returncode}, "
+                    f"no secret (elapsed {elapsed:.2f}s, "
+                    f"stderr: {result.stderr.strip()[:200] or 'none'})")
+        except KeyError as e:
+            err(f"unknown placeholder in password command: {e}")
+        except Exception as e:
+            dbg(f"password lookup failed after "
+                f"{time.time() - t0:.2f}s: {e}")
+        if password:
+            GLib.idle_add(self._feed_password, terminal, password)
+            dbg(f"password lookup: dispatched typing callback "
+                f"to UI thread for '{user}@{host}'")
+        else:
+            dbg(f"no password found for '{user}@{host}', "
+                f"manual typing required")
 
     def _feed_password(self, terminal: Any, password: str) -> bool:
         """ type the password + enter into the terminal (GLib idle callback) """
@@ -1727,36 +1777,47 @@ class Remote(MenuItem):
         times before giving up. Optional `then` callback runs after the
         text is fed (used to chain cd after the host command).
         """
-        def send(retries: int = PASSWORD_COMMAND_MAX_RETRIES) -> bool:
-            line, _row = self._get_prompt_line(terminal)
-            if PASSWORD_PROMPT_RE.search(line):
-                if retries > 0:
-                    dbg(f"delayed send {text.strip()!r}: password prompt "
-                        f"still active, deferring "
-                        f"({PASSWORD_COMMAND_MAX_RETRIES - retries + 1}/"
-                        f"{PASSWORD_COMMAND_MAX_RETRIES})")
-                    GLib.timeout_add(
-                        PASSWORD_COMMAND_RETRY_INTERVAL,
-                        lambda: send(retries - 1)
-                    )
-                    return False
-                dbg(f"delayed send {text.strip()!r}: password prompt "
-                    f"persisted too long "
-                    f"({PASSWORD_COMMAND_MAX_RETRIES} retries), giving up")
-                return False
-            vte = terminal.get_vte()
-            if vte is None:
-                dbg(f"delayed send {text.strip()!r}: terminal has no vte, "
-                    f"skipping")
-                return False
-            dbg(f"Sending delayed command {text.strip()!r}")
-            vte.feed_child(text.encode())
-            if then is not None:
-                then()
-            return False  # run once
-        GLib.timeout_add(delay_ms, send)
+        GLib.timeout_add(
+            delay_ms, self._send_when_no_prompt, terminal, text, then,
+            PASSWORD_COMMAND_MAX_RETRIES
+        )
         dbg(f"scheduled delayed command {text.strip()!r} for "
             f"{delay_ms}ms from now")
+
+    def _send_when_no_prompt(self, terminal, text, then, retries) -> bool:
+        """
+        GLib timeout callback for _send_after_delay: feed `text` unless a
+        password prompt is on the cursor row, in which case re-check every
+        PASSWORD_COMMAND_RETRY_INTERVAL ms while `retries` remain. A method
+        rather than a closure so dbg() attributes its output to Remote.
+        """
+        line, _row = self._get_prompt_line(terminal)
+        if PASSWORD_PROMPT_RE.search(line):
+            if retries > 0:
+                dbg(f"delayed send {text.strip()!r}: password prompt "
+                    f"still active, deferring "
+                    f"({PASSWORD_COMMAND_MAX_RETRIES - retries + 1}/"
+                    f"{PASSWORD_COMMAND_MAX_RETRIES})")
+                GLib.timeout_add(
+                    PASSWORD_COMMAND_RETRY_INTERVAL,
+                    self._send_when_no_prompt, terminal, text, then,
+                    retries - 1
+                )
+                return False
+            dbg(f"delayed send {text.strip()!r}: password prompt "
+                f"persisted too long "
+                f"({PASSWORD_COMMAND_MAX_RETRIES} retries), giving up")
+            return False
+        vte = terminal.get_vte()
+        if vte is None:
+            dbg(f"delayed send {text.strip()!r}: terminal has no vte, "
+                f"skipping")
+            return False
+        dbg(f"Sending delayed command {text.strip()!r}")
+        vte.feed_child(text.encode())
+        if then is not None:
+            then()
+        return False  # run once
 
     def _send_host_command(self, terminal, child, remote_session):
         """
@@ -2095,14 +2156,11 @@ class Remote(MenuItem):
         elif command_before_cd and host_command:
             # Command first, then cd — both gated on no password prompt
             dbg(f"Will send command '{host_command}' after {host_command_delay}s, then cd after {cd_delay_ms}ms more (host config for '{remoteHost}')")
-            def send_cd() -> bool:
-                snippet = CD_CMD.format(cwd=self.remote_cwd) + os.linesep
-                dbg(f"Sending cd after command")
-                self._send_after_delay(terminal, snippet, 0)
-                return False
             self._send_after_delay(
                 terminal, f"{host_command}\n", command_delay_ms,
-                then=lambda: GLib.timeout_add(cd_delay_ms, send_cd)
+                then=lambda: GLib.timeout_add(
+                    cd_delay_ms, self._send_cd_after_command, terminal
+                )
             )
         elif host_command:
             # Cd first, then command — both gated on no password prompt
@@ -2124,6 +2182,13 @@ class Remote(MenuItem):
             Remote.sent_host_commands.add(terminal)
 
         self._apply_host_settings(terminal)
+
+    def _send_cd_after_command(self, terminal) -> bool:
+        """ GLib timeout callback: cd into remote_cwd once the host command ran """
+        snippet = CD_CMD.format(cwd=self.remote_cwd) + os.linesep
+        dbg(f"Sending cd after command")
+        self._send_after_delay(terminal, snippet, 0)
+        return False
 
     def _get_default_profile(self, remote_type: Optional[RemoteSession]) -> str:
         """
